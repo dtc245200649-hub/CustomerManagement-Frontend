@@ -33,3 +33,11 @@ export function signIn(email, password) {
 export function getCurrentUser(token) {
   return request("/api/auth/me", { token });
 }
+
+export function refreshSession(token) {
+  return request("/api/auth/refresh", { token, method: "POST" });
+}
+
+export function signOut(token) {
+  return request("/api/auth/logout", { token, method: "POST" });
+}

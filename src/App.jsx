@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Link,
   Navigate,
@@ -7,9 +7,12 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
-import { getCurrentUser, signIn } from "./api.js";
+import { getCurrentUser, refreshSession, signIn, signOut } from "./api.js";
 
 const TOKEN_KEY = "customer-management-access-token";
+const SESSION_CHECK_INTERVAL_MS = 15_000;
+const SESSION_ACTIVITY_WINDOW_MS = 5 * 60_000;
+const SESSION_REFRESH_LEAD_MS = 60_000;
 
 function LoginPage({ onSignedIn, initialError }) {
   const navigate = useNavigate();
@@ -24,8 +27,7 @@ function LoginPage({ onSignedIn, initialError }) {
     setSubmitting(true);
     try {
       const result = await signIn(email.trim(), password);
-      sessionStorage.setItem(TOKEN_KEY, result.access_token);
-      onSignedIn(result.user);
+      onSignedIn(result);
       navigate(`/dashboard/${encodeURIComponent(result.user.role)}`, {
         replace: true,
       });
@@ -89,9 +91,10 @@ function LoginPage({ onSignedIn, initialError }) {
   );
 }
 
-function DashboardPage({ user, onSignOut }) {
+function DashboardPage({ user, onSignOut, error }) {
   const { role } = useParams();
   const navigate = useNavigate();
+  const [signingOut, setSigningOut] = useState(false);
 
   useEffect(() => {
     if (user && role !== user.role) {
@@ -118,12 +121,19 @@ function DashboardPage({ user, onSignOut }) {
         <button
           className="sign-out-button"
           type="button"
-          onClick={() => {
-            onSignOut();
-            navigate("/login", { replace: true });
+          disabled={signingOut}
+          onClick={async () => {
+            setSigningOut(true);
+            try {
+              if (await onSignOut()) {
+                navigate("/login", { replace: true });
+              }
+            } finally {
+              setSigningOut(false);
+            }
           }}
         >
-          Đăng xuất
+          {signingOut ? "Đang đăng xuất..." : "Đăng xuất"}
         </button>
       </header>
       <section className="welcome-card">
@@ -132,6 +142,11 @@ function DashboardPage({ user, onSignOut }) {
         <p>
           Bạn đã đăng nhập với tài khoản <strong>{user.email}</strong>.
         </p>
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
         <div className="role-badge">
           Vai trò: <strong>{user.role}</strong>
         </div>
@@ -146,8 +161,12 @@ function DashboardPage({ user, onSignOut }) {
 
 export default function App() {
   const [user, setUser] = useState(null);
+  const [session, setSession] = useState(null);
   const [checkingSession, setCheckingSession] = useState(true);
   const [sessionError, setSessionError] = useState("");
+  const [authError, setAuthError] = useState("");
+  const lastActivityAt = useRef(Date.now());
+  const refreshingSession = useRef(false);
 
   useEffect(() => {
     const token = sessionStorage.getItem(TOKEN_KEY);
@@ -157,10 +176,17 @@ export default function App() {
     }
 
     getCurrentUser(token)
-      .then(setUser)
+      .then((currentUser) => {
+        setUser(currentUser);
+        setSession({
+          expiresAt: Date.now() + currentUser.expires_in * 1000,
+          lifetimeMs: currentUser.expires_in * 1000,
+        });
+      })
       .catch((requestError) => {
         if (requestError.status === 401) {
           sessionStorage.removeItem(TOKEN_KEY);
+          setSessionError(requestError.message);
         } else {
           setSessionError(requestError.message);
         }
@@ -168,9 +194,129 @@ export default function App() {
       .finally(() => setCheckingSession(false));
   }, []);
 
-  function signOut() {
-    sessionStorage.removeItem(TOKEN_KEY);
-    setUser(null);
+  useEffect(() => {
+    if (!user || !session) {
+      return undefined;
+    }
+
+    const recordActivity = () => {
+      lastActivityAt.current = Date.now();
+    };
+    const expireSession = (message) => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      setUser(null);
+      setSession(null);
+      setSessionError(message);
+      setAuthError("");
+    };
+    const activityEvents = [
+      "pointerdown",
+      "pointermove",
+      "keydown",
+      "touchstart",
+      "wheel",
+      "focus",
+    ];
+    activityEvents.forEach((eventName) =>
+      window.addEventListener(eventName, recordActivity),
+    );
+
+    const timer = window.setInterval(async () => {
+      const now = Date.now();
+      if (now >= session.expiresAt) {
+        expireSession("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
+        return;
+      }
+
+      const refreshBeforeMs = Math.min(
+        SESSION_REFRESH_LEAD_MS,
+        session.lifetimeMs / 2,
+      );
+      const isRecentlyActive =
+        now - lastActivityAt.current <= SESSION_ACTIVITY_WINDOW_MS;
+      if (
+        now < session.expiresAt - refreshBeforeMs ||
+        !isRecentlyActive ||
+        refreshingSession.current
+      ) {
+        return;
+      }
+
+      const token = sessionStorage.getItem(TOKEN_KEY);
+      if (!token) {
+        expireSession("Phiên đăng nhập đã kết thúc. Vui lòng đăng nhập lại.");
+        return;
+      }
+
+      refreshingSession.current = true;
+      try {
+        const result = await refreshSession(token);
+        if (sessionStorage.getItem(TOKEN_KEY) !== token) {
+          return;
+        }
+        sessionStorage.setItem(TOKEN_KEY, result.access_token);
+        setSession({
+          expiresAt: Date.now() + result.expires_in * 1000,
+          lifetimeMs: result.expires_in * 1000,
+        });
+        setAuthError("");
+      } catch (requestError) {
+        if (requestError.status === 401) {
+          expireSession("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
+        } else {
+          setAuthError(requestError.message);
+        }
+      } finally {
+        refreshingSession.current = false;
+      }
+    }, SESSION_CHECK_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(timer);
+      activityEvents.forEach((eventName) =>
+        window.removeEventListener(eventName, recordActivity),
+      );
+    };
+  }, [session, user]);
+
+  function handleSignedIn(result) {
+    sessionStorage.setItem(TOKEN_KEY, result.access_token);
+    setUser(result.user);
+    setSession({
+      expiresAt: Date.now() + result.expires_in * 1000,
+      lifetimeMs: result.expires_in * 1000,
+    });
+    setSessionError("");
+    setAuthError("");
+    lastActivityAt.current = Date.now();
+  }
+
+  async function handleSignOut() {
+    const token = sessionStorage.getItem(TOKEN_KEY);
+    if (!token) {
+      setUser(null);
+      setSession(null);
+      return true;
+    }
+
+    try {
+      await signOut(token);
+      sessionStorage.removeItem(TOKEN_KEY);
+      setUser(null);
+      setSession(null);
+      setAuthError("");
+      return true;
+    } catch (requestError) {
+      if (requestError.status === 401) {
+        sessionStorage.removeItem(TOKEN_KEY);
+        setUser(null);
+        setSession(null);
+        setSessionError("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
+        return true;
+      }
+      setAuthError(requestError.message);
+      return false;
+    }
   }
 
   if (checkingSession) {
@@ -188,13 +334,19 @@ export default function App() {
               replace
             />
           ) : (
-            <LoginPage onSignedIn={setUser} initialError={sessionError} />
+            <LoginPage onSignedIn={handleSignedIn} initialError={sessionError} />
           )
         }
       />
       <Route
         path="/dashboard/:role"
-        element={<DashboardPage user={user} onSignOut={signOut} />}
+        element={
+          <DashboardPage
+            user={user}
+            onSignOut={handleSignOut}
+            error={authError}
+          />
+        }
       />
       <Route
         path="*"

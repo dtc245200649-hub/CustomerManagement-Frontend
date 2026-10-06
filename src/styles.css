@@ -197,6 +197,11 @@ input:focus {
   font-weight: 600;
 }
 
+.sign-out-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 .welcome-card {
   width: min(100%, 760px);
   margin: 11vh auto 0;
